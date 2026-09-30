@@ -169,7 +169,6 @@ server.tool("send_text_message", "Send an SMS text message to a customer.", {
 const app = (0, express_1.default)();
 // Basic configurations for Web clients
 app.use((0, cors_1.default)());
-app.use(express_1.default.json());
 // Optional: Global MCP Server Authentication
 const mcpAuthToken = process.env.MCP_API_KEY;
 if (mcpAuthToken) {
@@ -190,10 +189,7 @@ if (mcpAuthToken) {
 }
 const transports = new Map();
 app.get('/sse', async (req, res) => {
-    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-    const host = req.headers['x-forwarded-host'] || req.get('host');
-    const messageUrl = `${protocol}://${host}/message`;
-    const transport = new sse_js_1.SSEServerTransport(messageUrl, res);
+    const transport = new sse_js_1.SSEServerTransport('/message', res);
     await server.connect(transport);
     transports.set(transport.sessionId, transport);
     req.on('close', () => {
@@ -211,7 +207,7 @@ app.post('/message', async (req, res) => {
     }
 });
 // Basic REST endpoints for ChatGPT
-app.post('/api/tools/:toolName', async (req, res) => {
+app.post('/api/tools/:toolName', express_1.default.json(), async (req, res) => {
     res.json({ error: "Use MCP SSE transport. OpenAPI proxy required." });
 });
 const transportType = process.env.TRANSPORT || 'stdio';
