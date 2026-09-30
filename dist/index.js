@@ -174,6 +174,10 @@ app.use(express_1.default.json());
 const mcpAuthToken = process.env.MCP_API_KEY;
 if (mcpAuthToken) {
     app.use((req, res, next) => {
+        // Browsers don't send auth headers on OPTIONS preflight
+        if (req.method === 'OPTIONS') {
+            return next();
+        }
         // Only protect /sse and /message paths
         if (req.path === '/sse' || req.path === '/message') {
             const authHeader = req.headers.authorization;
@@ -186,7 +190,10 @@ if (mcpAuthToken) {
 }
 const transports = new Map();
 app.get('/sse', async (req, res) => {
-    const transport = new sse_js_1.SSEServerTransport('/message', res);
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.headers['x-forwarded-host'] || req.get('host');
+    const messageUrl = `${protocol}://${host}/message`;
+    const transport = new sse_js_1.SSEServerTransport(messageUrl, res);
     await server.connect(transport);
     transports.set(transport.sessionId, transport);
     req.on('close', () => {
