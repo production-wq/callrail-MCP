@@ -1,7 +1,7 @@
 {
   "name": "callrail-mcp",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "api/index.ts",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",

@@ -191,79 +191,66 @@ server.tool(
   }
 );
 
-const transportType = process.env.TRANSPORT || 'stdio';
+const app = express();
 
-if (transportType === 'sse' || process.env.VERCEL) {
-  const app = express();
-  
-  // Basic configurations for Web clients
-  app.use(cors());
-  app.use(express.json());
+// Basic configurations for Web clients
+app.use(cors());
+app.use(express.json());
 
-  // Optional: Global MCP Server Authentication
-  // If MCP_API_KEY environment variable is set on Vercel, we check it via Bearer token
-  const mcpAuthToken = process.env.MCP_API_KEY;
-  if (mcpAuthToken) {
-    app.use((req, res, next) => {
+// Optional: Global MCP Server Authentication
+const mcpAuthToken = process.env.MCP_API_KEY;
+if (mcpAuthToken) {
+  app.use((req, res, next) => {
+    // Only protect /sse and /message paths
+    if (req.path === '/sse' || req.path === '/message') {
       const authHeader = req.headers.authorization;
       if (!authHeader || authHeader !== `Bearer ${mcpAuthToken}`) {
         return res.status(401).json({ error: 'Unauthorized: Invalid or missing Bearer token' });
       }
-      next();
-    });
-  }
-
-  const transports = new Map<string, SSEServerTransport>();
-  
-  app.get('/sse', async (req, res) => {
-    const transport = new SSEServerTransport('/message', res);
-    await server.connect(transport);
-    transports.set(transport.sessionId, transport);
-    
-    req.on('close', () => {
-      transports.delete(transport.sessionId);
-    });
-  });
-  
-  app.post('/message', async (req, res) => {
-    const sessionId = req.query.sessionId as string;
-    const transport = transports.get(sessionId);
-    if (transport) {
-      await transport.handlePostMessage(req, res);
-    } else {
-      res.status(404).send('Session not found. In serverless environments (like Vercel), the container might have restarted. Please reconnect.');
     }
+    next();
   });
+}
 
-  // Basic REST endpoints to enable ChatGPT actions (OpenAPI fallback)
-  app.post('/api/tools/:toolName', async (req, res) => {
-    const { toolName } = req.params;
-    try {
-       // @ts-ignore - reaching into internals to execute for standard REST clients
-       const tool = server._tools?.[toolName] || (server as any).tools?.[toolName];
-       if (!tool && !(server as any).registeredTools) {
-           return res.status(404).json({ error: "Tool not found or internal server mapping changed." });
-       }
-       
-       // For MCP SDK, we can dispatch a JSONRPC request manually or just route it.
-       // However, to keep it simple without internals, let's just create an internal router for ChatGPT
-       res.json({ error: "To support ChatGPT, please use a hosted MCP-to-OpenAPI proxy or configure the OpenAPI schema for these endpoints." });
-    } catch (err: any) {
-       res.status(500).json({ error: err.message });
-    }
+const transports = new Map<string, SSEServerTransport>();
+
+app.get('/sse', async (req, res) => {
+  const transport = new SSEServerTransport('/message', res);
+  await server.connect(transport);
+  transports.set(transport.sessionId, transport);
+  
+  req.on('close', () => {
+    transports.delete(transport.sessionId);
   });
-  
-  if (!process.env.VERCEL) {
-    const port = process.env.PORT || 3000;
-    app.listen(port, () => {
-      console.log(`CallRail MCP server running on SSE transport at http://localhost:${port}`);
-    });
+});
+
+app.post('/message', async (req, res) => {
+  const sessionId = req.query.sessionId as string;
+  const transport = transports.get(sessionId);
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(404).send('Session not found. In serverless environments, reconnect.');
   }
-  
-  module.exports = app;
-} else {
+});
+
+// Basic REST endpoints for ChatGPT
+app.post('/api/tools/:toolName', async (req, res) => {
+  res.json({ error: "Use MCP SSE transport. OpenAPI proxy required." });
+});
+
+const transportType = process.env.TRANSPORT || 'stdio';
+
+if (transportType === 'sse' && !process.env.VERCEL) {
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => {
+    console.log(`CallRail MCP server running on SSE transport at http://localhost:${port}`);
+  });
+} else if (transportType === 'stdio' && !process.env.VERCEL) {
   const transport = new StdioServerTransport();
   server.connect(transport).then(() => {
     console.error("CallRail MCP server running on stdio transport");
   });
 }
+
+export default app;
