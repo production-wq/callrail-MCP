@@ -7,132 +7,183 @@ const mcp_js_1 = require("@modelcontextprotocol/sdk/server/mcp.js");
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const stdio_js_1 = require("@modelcontextprotocol/sdk/server/stdio.js");
 const express_1 = __importDefault(require("express"));
+const cors_1 = __importDefault(require("cors"));
 const axios_1 = __importDefault(require("axios"));
 const zod_1 = require("zod");
 const server = new mcp_js_1.McpServer({
     name: "callrail-mcp",
     version: "1.0.0"
 });
+// Helper to get CallRail API key
+const getApiKey = (args) => args.api_key || process.env.CALLRAIL_API_KEY;
+const getHeaders = (args) => ({ Authorization: `Token token="${getApiKey(args)}"` });
 server.tool("get_client_metrics", "Get the number of leads (form submissions) and calls for a client over a date range.", {
     account_id: zod_1.z.string().describe("The CallRail account ID"),
     company_id: zod_1.z.string().optional().describe("The CallRail company ID to filter by client"),
     date_range: zod_1.z.enum(["recent", "today", "yesterday", "last_7_days", "last_30_days", "this_month", "last_month", "this_year", "last_year", "all_time"]).default("this_month").describe("The date range to query"),
-    api_key: zod_1.z.string().optional().describe("CallRail API key. Can also be set via CALLRAIL_API_KEY environment variable.")
+    api_key: zod_1.z.string().optional().describe("CallRail API key.")
 }, async (args) => {
-    const apiKey = args.api_key || process.env.CALLRAIL_API_KEY;
-    if (!apiKey) {
-        return {
-            content: [{ type: "text", text: "Error: CallRail API key is required. Pass it as a parameter or set CALLRAIL_API_KEY." }]
-        };
-    }
+    if (!getApiKey(args))
+        return { content: [{ type: "text", text: "Error: CallRail API key is required." }] };
     try {
-        const headers = { Authorization: `Token token="${apiKey}"` };
-        const params = {
-            date_range: args.date_range,
-            per_page: 10
-        };
-        if (args.company_id) {
+        const headers = getHeaders(args);
+        const params = { date_range: args.date_range, per_page: 10 };
+        if (args.company_id)
             params.company_id = args.company_id;
-        }
-        // Fetch Calls
-        const callsUrl = `https://api.callrail.com/v3/a/${args.account_id}/calls.json`;
-        const callsRes = await axios_1.default.get(callsUrl, { headers, params });
-        // Fetch Form Submissions (Leads)
-        const formsUrl = `https://api.callrail.com/v3/a/${args.account_id}/form_submissions.json`;
-        const formsRes = await axios_1.default.get(formsUrl, { headers, params });
+        const callsRes = await axios_1.default.get(`https://api.callrail.com/v3/a/${args.account_id}/calls.json`, { headers, params });
+        const formsRes = await axios_1.default.get(`https://api.callrail.com/v3/a/${args.account_id}/form_submissions.json`, { headers, params });
         const totalCalls = callsRes.data.total_records;
         const totalLeads = formsRes.data.total_records;
         const recentCalls = callsRes.data.calls.map((c) => ({
-            id: c.id,
-            start_time: c.start_time,
-            customer_phone: c.customer_phone_number,
-            duration: c.duration,
-            answered: c.answered
+            id: c.id, start_time: c.start_time, customer_phone: c.customer_phone_number, duration: c.duration, answered: c.answered
         }));
         const recentLeads = formsRes.data.form_submissions.map((f) => ({
-            id: f.id,
-            submitted_at: f.submitted_at,
-            customer_name: f.customer_name,
-            customer_email: f.customer_email,
-            source: f.source
+            id: f.id, submitted_at: f.submitted_at, customer_name: f.customer_name, customer_email: f.customer_email, source: f.source
         }));
-        const summary = `Metrics for ${args.date_range}:\nTotal Calls: ${totalCalls}\nTotal Leads (Form Submissions): ${totalLeads}\n`;
         return {
             content: [
-                { type: "text", text: summary },
+                { type: "text", text: `Metrics for ${args.date_range}:\nTotal Calls: ${totalCalls}\nTotal Leads (Form Submissions): ${totalLeads}\n` },
                 { type: "text", text: `Recent Calls:\n${JSON.stringify(recentCalls, null, 2)}` },
                 { type: "text", text: `Recent Leads:\n${JSON.stringify(recentLeads, null, 2)}` }
             ]
         };
     }
     catch (error) {
-        const msg = error.response ? JSON.stringify(error.response.data) : error.message;
-        return {
-            content: [{ type: "text", text: `Error fetching CallRail data: ${msg}` }]
-        };
+        return { content: [{ type: "text", text: `Error: ${error.response ? JSON.stringify(error.response.data) : error.message}` }] };
     }
 });
-server.tool("list_companies", "List companies in a CallRail account to get their company_ids.", {
-    account_id: zod_1.z.string().describe("The CallRail account ID"),
-    api_key: zod_1.z.string().optional().describe("CallRail API key.")
-}, async (args) => {
-    const apiKey = args.api_key || process.env.CALLRAIL_API_KEY;
-    if (!apiKey) {
-        return {
-            content: [{ type: "text", text: "Error: CallRail API key is required." }]
-        };
-    }
+server.tool("list_companies", "List companies in a CallRail account.", { account_id: zod_1.z.string().describe("The CallRail account ID"), api_key: zod_1.z.string().optional() }, async (args) => {
+    if (!getApiKey(args))
+        return { content: [{ type: "text", text: "Error: API key required." }] };
     try {
-        const headers = { Authorization: `Token token="${apiKey}"` };
-        const url = `https://api.callrail.com/v3/a/${args.account_id}/companies.json`;
-        const res = await axios_1.default.get(url, { headers, params: { per_page: 100 } });
-        const companies = res.data.companies.map((c) => ({
-            id: c.id,
-            name: c.name,
-            status: c.status
-        }));
-        return {
-            content: [{ type: "text", text: JSON.stringify(companies, null, 2) }]
-        };
+        const res = await axios_1.default.get(`https://api.callrail.com/v3/a/${args.account_id}/companies.json`, { headers: getHeaders(args), params: { per_page: 100 } });
+        const companies = res.data.companies.map((c) => ({ id: c.id, name: c.name, status: c.status }));
+        return { content: [{ type: "text", text: JSON.stringify(companies, null, 2) }] };
     }
     catch (error) {
-        const msg = error.response ? JSON.stringify(error.response.data) : error.message;
-        return {
-            content: [{ type: "text", text: `Error fetching CallRail data: ${msg}` }]
-        };
+        return { content: [{ type: "text", text: `Error: ${error.response ? JSON.stringify(error.response.data) : error.message}` }] };
     }
 });
-server.tool("list_accounts", "List all CallRail accounts accessible by the API key.", {
-    api_key: zod_1.z.string().optional().describe("CallRail API key.")
-}, async (args) => {
-    const apiKey = args.api_key || process.env.CALLRAIL_API_KEY;
-    if (!apiKey) {
-        return {
-            content: [{ type: "text", text: "Error: CallRail API key is required." }]
-        };
-    }
+server.tool("list_accounts", "List all accessible CallRail accounts.", { api_key: zod_1.z.string().optional() }, async (args) => {
+    if (!getApiKey(args))
+        return { content: [{ type: "text", text: "Error: API key required." }] };
     try {
-        const headers = { Authorization: `Token token="${apiKey}"` };
-        const url = `https://api.callrail.com/v3/a.json`;
-        const res = await axios_1.default.get(url, { headers, params: { per_page: 100 } });
-        const accounts = res.data.accounts.map((a) => ({
-            id: a.id,
-            name: a.name
-        }));
-        return {
-            content: [{ type: "text", text: JSON.stringify(accounts, null, 2) }]
-        };
+        const res = await axios_1.default.get(`https://api.callrail.com/v3/a.json`, { headers: getHeaders(args), params: { per_page: 100 } });
+        const accounts = res.data.accounts.map((a) => ({ id: a.id, name: a.name }));
+        return { content: [{ type: "text", text: JSON.stringify(accounts, null, 2) }] };
     }
     catch (error) {
-        const msg = error.response ? JSON.stringify(error.response.data) : error.message;
-        return {
-            content: [{ type: "text", text: `Error fetching CallRail data: ${msg}` }]
+        return { content: [{ type: "text", text: `Error: ${error.response ? JSON.stringify(error.response.data) : error.message}` }] };
+    }
+});
+server.tool("list_all_calls", "List calls with rich details.", {
+    account_id: zod_1.z.string(),
+    company_id: zod_1.z.string().optional(),
+    date_range: zod_1.z.string().optional().default("recent").describe("e.g. recent, today, this_month"),
+    per_page: zod_1.z.number().optional().default(20),
+    api_key: zod_1.z.string().optional()
+}, async (args) => {
+    if (!getApiKey(args))
+        return { content: [{ type: "text", text: "Error: API key required." }] };
+    try {
+        const params = { date_range: args.date_range, per_page: args.per_page };
+        if (args.company_id)
+            params.company_id = args.company_id;
+        const res = await axios_1.default.get(`https://api.callrail.com/v3/a/${args.account_id}/calls.json`, { headers: getHeaders(args), params });
+        return { content: [{ type: "text", text: JSON.stringify(res.data.calls, null, 2) }] };
+    }
+    catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.response ? JSON.stringify(error.response.data) : error.message}` }] };
+    }
+});
+server.tool("get_call_details", "Get details for a specific call by ID.", {
+    account_id: zod_1.z.string(),
+    call_id: zod_1.z.string(),
+    api_key: zod_1.z.string().optional()
+}, async (args) => {
+    if (!getApiKey(args))
+        return { content: [{ type: "text", text: "Error: API key required." }] };
+    try {
+        const res = await axios_1.default.get(`https://api.callrail.com/v3/a/${args.account_id}/calls/${args.call_id}.json`, { headers: getHeaders(args) });
+        return { content: [{ type: "text", text: JSON.stringify(res.data, null, 2) }] };
+    }
+    catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.response ? JSON.stringify(error.response.data) : error.message}` }] };
+    }
+});
+server.tool("update_call", "Edit a call in CallRail (e.g. add notes, tags, update customer name).", {
+    account_id: zod_1.z.string(),
+    call_id: zod_1.z.string(),
+    note: zod_1.z.string().optional().describe("Note to add/update"),
+    tags: zod_1.z.array(zod_1.z.string()).optional().describe("Tags to assign"),
+    customer_name: zod_1.z.string().optional().describe("Update customer name"),
+    lead_status: zod_1.z.enum(["good_lead", "not_a_lead", "not_scored"]).optional().describe("Update lead status"),
+    value: zod_1.z.string().optional().describe("Monetary value (e.g. '$50.00')"),
+    api_key: zod_1.z.string().optional()
+}, async (args) => {
+    if (!getApiKey(args))
+        return { content: [{ type: "text", text: "Error: API key required." }] };
+    try {
+        const data = {};
+        if (args.note !== undefined)
+            data.note = args.note;
+        if (args.tags !== undefined)
+            data.tags = args.tags;
+        if (args.customer_name !== undefined)
+            data.customer_name = args.customer_name;
+        if (args.lead_status !== undefined)
+            data.lead_status = args.lead_status;
+        if (args.value !== undefined)
+            data.value = args.value;
+        const res = await axios_1.default.put(`https://api.callrail.com/v3/a/${args.account_id}/calls/${args.call_id}.json`, data, { headers: getHeaders(args) });
+        return { content: [{ type: "text", text: `Call updated successfully:\n${JSON.stringify(res.data, null, 2)}` }] };
+    }
+    catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.response ? JSON.stringify(error.response.data) : error.message}` }] };
+    }
+});
+server.tool("send_text_message", "Send an SMS text message to a customer.", {
+    account_id: zod_1.z.string(),
+    company_id: zod_1.z.string(),
+    customer_phone_number: zod_1.z.string().describe("E.164 format e.g. +14044442233"),
+    tracking_number: zod_1.z.string().describe("Your tracking number sending the message"),
+    content: zod_1.z.string().describe("Text message content"),
+    api_key: zod_1.z.string().optional()
+}, async (args) => {
+    if (!getApiKey(args))
+        return { content: [{ type: "text", text: "Error: API key required." }] };
+    try {
+        const data = {
+            company_id: args.company_id,
+            customer_phone_number: args.customer_phone_number,
+            tracking_number: args.tracking_number,
+            content: args.content
         };
+        const res = await axios_1.default.post(`https://api.callrail.com/v3/a/${args.account_id}/text-messages.json`, data, { headers: getHeaders(args) });
+        return { content: [{ type: "text", text: `Text sent successfully:\n${JSON.stringify(res.data, null, 2)}` }] };
+    }
+    catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.response ? JSON.stringify(error.response.data) : error.message}` }] };
     }
 });
 const transportType = process.env.TRANSPORT || 'stdio';
 if (transportType === 'sse' || process.env.VERCEL) {
     const app = (0, express_1.default)();
+    // Basic configurations for Web clients
+    app.use((0, cors_1.default)());
+    app.use(express_1.default.json());
+    // Optional: Global MCP Server Authentication
+    // If MCP_API_KEY environment variable is set on Vercel, we check it via Bearer token
+    const mcpAuthToken = process.env.MCP_API_KEY;
+    if (mcpAuthToken) {
+        app.use((req, res, next) => {
+            const authHeader = req.headers.authorization;
+            if (!authHeader || authHeader !== `Bearer ${mcpAuthToken}`) {
+                return res.status(401).json({ error: 'Unauthorized: Invalid or missing Bearer token' });
+            }
+            next();
+        });
+    }
     let transport = null;
     app.get('/sse', async (req, res) => {
         transport = new sse_js_1.SSEServerTransport('/message', res);
@@ -144,6 +195,23 @@ if (transportType === 'sse' || process.env.VERCEL) {
         }
         else {
             res.status(500).send('SSE not initialized');
+        }
+    });
+    // Basic REST endpoints to enable ChatGPT actions (OpenAPI fallback)
+    app.post('/api/tools/:toolName', async (req, res) => {
+        const { toolName } = req.params;
+        try {
+            // @ts-ignore - reaching into internals to execute for standard REST clients
+            const tool = server._tools?.[toolName] || server.tools?.[toolName];
+            if (!tool && !server.registeredTools) {
+                return res.status(404).json({ error: "Tool not found or internal server mapping changed." });
+            }
+            // For MCP SDK, we can dispatch a JSONRPC request manually or just route it.
+            // However, to keep it simple without internals, let's just create an internal router for ChatGPT
+            res.json({ error: "To support ChatGPT, please use a hosted MCP-to-OpenAPI proxy or configure the OpenAPI schema for these endpoints." });
+        }
+        catch (err) {
+            res.status(500).json({ error: err.message });
         }
     });
     if (!process.env.VERCEL) {
