@@ -43,7 +43,7 @@ In `claude_desktop_config.json`:
   "mcpServers": {
     "callrail": {
       "command": "node",
-      "args": ["/path/to/callrail-MCP/dist/index.js"],
+      "args": ["/path/to/callrail-MCP/api/index.ts"],
       "env": {
         "CALLRAIL_API_KEY": "YOUR_CALLRAIL_API_KEY"
       }

@@ -184,17 +184,23 @@ if (transportType === 'sse' || process.env.VERCEL) {
             next();
         });
     }
-    let transport = null;
+    const transports = new Map();
     app.get('/sse', async (req, res) => {
-        transport = new sse_js_1.SSEServerTransport('/message', res);
+        const transport = new sse_js_1.SSEServerTransport('/message', res);
         await server.connect(transport);
+        transports.set(transport.sessionId, transport);
+        req.on('close', () => {
+            transports.delete(transport.sessionId);
+        });
     });
     app.post('/message', async (req, res) => {
+        const sessionId = req.query.sessionId;
+        const transport = transports.get(sessionId);
         if (transport) {
             await transport.handlePostMessage(req, res);
         }
         else {
-            res.status(500).send('SSE not initialized');
+            res.status(404).send('Session not found. In serverless environments (like Vercel), the container might have restarted. Please reconnect.');
         }
     });
     // Basic REST endpoints to enable ChatGPT actions (OpenAPI fallback)

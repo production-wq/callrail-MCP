@@ -213,18 +213,25 @@ if (transportType === 'sse' || process.env.VERCEL) {
     });
   }
 
-  let transport: SSEServerTransport | null = null;
+  const transports = new Map<string, SSEServerTransport>();
   
   app.get('/sse', async (req, res) => {
-    transport = new SSEServerTransport('/message', res);
+    const transport = new SSEServerTransport('/message', res);
     await server.connect(transport);
+    transports.set(transport.sessionId, transport);
+    
+    req.on('close', () => {
+      transports.delete(transport.sessionId);
+    });
   });
   
   app.post('/message', async (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    const transport = transports.get(sessionId);
     if (transport) {
       await transport.handlePostMessage(req, res);
     } else {
-      res.status(500).send('SSE not initialized');
+      res.status(404).send('Session not found. In serverless environments (like Vercel), the container might have restarted. Please reconnect.');
     }
   });
 
