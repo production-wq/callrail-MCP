@@ -217,6 +217,10 @@ if (mcpAuthToken) {
 
 const transports = new Map<string, SSEServerTransport>();
 
+app.get('/', (req, res) => {
+  res.send('CallRail MCP Server is running! Please use the /sse endpoint for MCP connections.');
+});
+
 app.get('/sse', async (req, res) => {
   const transport = new SSEServerTransport('/message', res);
   await server.connect(transport);
