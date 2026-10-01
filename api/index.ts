@@ -21,6 +21,8 @@ const getHeaders = (args: any) => ({ Authorization: `Token token="${getApiKey(ar
 // ---------------------------------------------------------------------------
 const CALLRAIL_BASE = process.env.CALLRAIL_BASE_URL || "https://api.callrail.com/v3";
 const ATTRIBUTION_FIELDS = "company_id,company_name,source,medium,campaign,keywords,utm_source,utm_medium,utm_campaign,utm_term,utm_content,landing_page_url,lead_status";
+// CallRail rejects utm_term/utm_content on form_submissions, so forms use a reduced list.
+const FORM_ATTRIBUTION_FIELDS = "company_id,company_name,source,medium,campaign,keywords,utm_source,utm_medium,utm_campaign,landing_page_url,lead_status";
 const CALL_FIELDS = `${ATTRIBUTION_FIELDS},first_call,tracking_phone_number`;
 
 const DIMENSIONS = ["source", "medium", "campaign", "keywords", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "company_name", "landing_page_url", "tracking_number", "date", "month"] as const;
@@ -49,14 +51,15 @@ async function fetchAllWithFallback(url: string, listKey: string, headers: any, 
       return { ...out, fields, error: undefined as string | undefined };
     } catch (e: any) {
       lastError = e;
-      if (e.response?.status !== 400 && e.response?.status !== 422) break;
+      const st = e.response?.status;
+      if (!st || st < 400 || st >= 500 || st === 401 || st === 403 || st === 429) break;
     }
   }
   return { records: [] as any[], truncated: false, fields: "", error: lastError?.response ? JSON.stringify(lastError.response.data) : lastError?.message };
 }
 
 const FORM_FIELD_SETS = [
-  ATTRIBUTION_FIELDS,
+  FORM_ATTRIBUTION_FIELDS,
   "company_id,company_name,source,medium,campaign,keywords,utm_source,utm_medium,utm_campaign,landing_page_url",
   "company_id,company_name,source,medium,campaign",
   ""
@@ -357,7 +360,7 @@ function createServer() {
         if (args.date_from) { params.start_date = args.date_from; if (args.date_to) params.end_date = args.date_to; }
         else params.date_range = args.date_range;
         if (args.company_id) params.company_id = args.company_id;
-        const out = await fetchAllWithFallback(`${CALLRAIL_BASE}/a/${args.account_id}/form_submissions.json`, "form_submissions", getHeaders(args), params, 1, [`${ATTRIBUTION_FIELDS},form_data`, ...FORM_FIELD_SETS]);
+        const out = await fetchAllWithFallback(`${CALLRAIL_BASE}/a/${args.account_id}/form_submissions.json`, "form_submissions", getHeaders(args), params, 1, [`${FORM_ATTRIBUTION_FIELDS},form_data`, ...FORM_FIELD_SETS]);
         if (out.error) return { content: [{ type: "text", text: `Error: ${out.error}` }] };
         return { content: [{ type: "text", text: JSON.stringify(out.records, null, 2) }] };
       } catch (error: any) {
