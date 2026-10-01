@@ -19,7 +19,7 @@ const getHeaders = (args: any) => ({ Authorization: `Token token="${getApiKey(ar
 // the source, so we fetch the records with the `fields` parameter and group
 // them ourselves.
 // ---------------------------------------------------------------------------
-const CALLRAIL_BASE = "https://api.callrail.com/v3";
+const CALLRAIL_BASE = process.env.CALLRAIL_BASE_URL || "https://api.callrail.com/v3";
 const ATTRIBUTION_FIELDS = "company_id,company_name,source,medium,campaign,keywords,utm_source,utm_medium,utm_campaign,utm_term,utm_content,landing_page_url,lead_status";
 const CALL_FIELDS = `${ATTRIBUTION_FIELDS},first_call,tracking_phone_number`;
 
@@ -30,7 +30,7 @@ async function fetchAll(url: string, listKey: string, headers: any, params: any,
   const records: any[] = [];
   let truncated = false;
   for (let page = 1; ; page++) {
-    const res = await axios.get(url, { headers, params: { ...params, per_page: 250, page } });
+    const res = await axios.get(url, { headers, params: { per_page: 250, ...params, page } });
     records.push(...(res.data[listKey] || []));
     const totalPages = res.data.total_pages ?? 1;
     if (page >= totalPages) break;
@@ -38,6 +38,29 @@ async function fetchAll(url: string, listKey: string, headers: any, params: any,
   }
   return { records, truncated };
 }
+
+// Try progressively smaller `fields` lists so one unsupported field name never
+// hides all records. Returns which field set worked.
+async function fetchAllWithFallback(url: string, listKey: string, headers: any, params: any, maxPages: number, fieldSets: string[]) {
+  let lastError: any;
+  for (const fields of fieldSets) {
+    try {
+      const out = await fetchAll(url, listKey, headers, fields ? { ...params, fields } : params, maxPages);
+      return { ...out, fields, error: undefined as string | undefined };
+    } catch (e: any) {
+      lastError = e;
+      if (e.response?.status !== 400 && e.response?.status !== 422) break;
+    }
+  }
+  return { records: [] as any[], truncated: false, fields: "", error: lastError?.response ? JSON.stringify(lastError.response.data) : lastError?.message };
+}
+
+const FORM_FIELD_SETS = [
+  ATTRIBUTION_FIELDS,
+  "company_id,company_name,source,medium,campaign,keywords,utm_source,utm_medium,utm_campaign,landing_page_url",
+  "company_id,company_name,source,medium,campaign",
+  ""
+];
 
 function dimensionValue(rec: any, dim: Dimension, timeField: string): string {
   switch (dim) {
@@ -263,7 +286,7 @@ function createServer() {
 
         const [calls, forms] = await Promise.all([
           args.data_types === "forms" ? { records: [], truncated: false } : fetchAll(`${base}/calls.json`, "calls", headers, { ...params, fields: CALL_FIELDS }, args.max_pages),
-          args.data_types === "calls" ? { records: [], truncated: false } : fetchAll(`${base}/form_submissions.json`, "form_submissions", headers, { ...params, fields: ATTRIBUTION_FIELDS }, args.max_pages)
+          args.data_types === "calls" ? { records: [], truncated: false } : fetchAllWithFallback(`${base}/form_submissions.json`, "form_submissions", headers, params, args.max_pages, FORM_FIELD_SETS)
         ]);
 
         const rows = new Map<string, any>();
@@ -300,13 +323,43 @@ function createServer() {
           calls: t.calls + r.calls, form_submissions: t.form_submissions + r.form_submissions, total_leads: t.total_leads + r.total_leads
         }), { calls: 0, form_submissions: 0, total_leads: 0 });
 
-        const note = (calls.truncated || forms.truncated) ? "\nWARNING: results truncated at max_pages; narrow the date range or raise max_pages." : "";
+        const formsError = (forms as any).error as string | undefined;
+        const note = ((calls.truncated || forms.truncated) ? "\nWARNING: results truncated at max_pages; narrow the date range or raise max_pages." : "")
+          + (formsError ? `\nWARNING: form submissions could not be fetched, so form counts are missing: ${formsError}` : "");
         return {
           content: [{
             type: "text",
-            text: `Period: ${args.date_from ? `${args.date_from} to ${args.date_to || "today"}` : params.date_range}\nGrouped by: ${args.dimensions.join(", ")}\nTotals: ${JSON.stringify(totals)}${note}\n\n${JSON.stringify(data, null, 2)}`
+            text: `Period: ${args.date_from ? `${args.date_from} to ${args.date_to || "today"}` : params.date_range}\nGrouped by: ${args.dimensions.join(", ")}\nRecords fetched: ${calls.records.length} calls, ${forms.records.length} form submissions\nTotals: ${JSON.stringify(totals)}${note}\n\n${JSON.stringify(data, null, 2)}`
           }]
         };
+      } catch (error: any) {
+        return { content: [{ type: "text", text: `Error: ${error.response ? JSON.stringify(error.response.data) : error.message}` }] };
+      }
+    }
+  );
+
+  server.tool(
+    "list_form_submissions",
+    "List individual form submissions (leads) with name, email, source, medium, campaign, landing page and the submitted form data.",
+    {
+      account_id: z.string(),
+      company_id: z.string().optional(),
+      date_range: z.string().optional().default("this_month").describe("e.g. today, last_7_days, this_month"),
+      date_from: z.string().optional().describe("Start date YYYY-MM-DD"),
+      date_to: z.string().optional().describe("End date YYYY-MM-DD"),
+      per_page: z.number().optional().default(50),
+      api_key: z.string().optional()
+    },
+    async (args) => {
+      if (!getApiKey(args)) return { content: [{ type: "text", text: "Error: API key required." }] };
+      try {
+        const params: any = { per_page: args.per_page };
+        if (args.date_from) { params.start_date = args.date_from; if (args.date_to) params.end_date = args.date_to; }
+        else params.date_range = args.date_range;
+        if (args.company_id) params.company_id = args.company_id;
+        const out = await fetchAllWithFallback(`${CALLRAIL_BASE}/a/${args.account_id}/form_submissions.json`, "form_submissions", getHeaders(args), params, 1, [`${ATTRIBUTION_FIELDS},form_data`, ...FORM_FIELD_SETS]);
+        if (out.error) return { content: [{ type: "text", text: `Error: ${out.error}` }] };
+        return { content: [{ type: "text", text: JSON.stringify(out.records, null, 2) }] };
       } catch (error: any) {
         return { content: [{ type: "text", text: `Error: ${error.response ? JSON.stringify(error.response.data) : error.message}` }] };
       }
