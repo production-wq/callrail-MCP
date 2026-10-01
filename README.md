@@ -4,6 +4,8 @@ This is a Model Context Protocol (MCP) server for the CallRail API. It allows AI
 
 ## New Features
 
+- **get_marketing_data** (Windsor.ai-style): calls + form submissions broken down by `source`, `medium`, `campaign`, `utm_*`, `company_name`, `date`, `month`, etc. Example: `dimensions: ["source"]`, `date_from: "2026-09-01"`, `date_to: "2026-09-30"`. Omit `company_id` to cover every client in the account (add `company_name` to dimensions to split them).
+
 - **get_client_metrics**: Get total calls and leads.
 - **list_companies**: Get the companies within an account.
 - **list_accounts**: List accounts.
@@ -51,3 +53,13 @@ In `claude_desktop_config.json`:
   }
 }
 ```
+
+
+## Deploying on Render
+
+- Build command: `npm install && npm run build`
+- Start command: `npm start` (sets `TRANSPORT=sse`, listens on Render's `$PORT`)
+- Env vars: `CALLRAIL_API_KEY` (required), `MCP_API_KEY` (recommended)
+- Health check path: `/health`
+- Connect clients to `https://<service>.onrender.com/mcp` (Streamable HTTP, preferred) or `/sse`.
+- Free instances sleep after inactivity; the first request after a sleep is slow.
