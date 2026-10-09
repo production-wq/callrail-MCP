@@ -385,8 +385,8 @@ if (mcpAuthToken) {
     if (req.method === 'OPTIONS') {
       return next();
     }
-    // Only protect /sse and /message paths
-    if (req.path === '/sse' || req.path === '/message' || req.path === '/mcp') {
+    // Only protect /sse, /message, /mcp, and /api/tools paths
+    if (req.path === '/sse' || req.path === '/message' || req.path === '/mcp' || req.path.startsWith('/api/tools')) {
       const authHeader = req.headers.authorization;
       if (!authHeader || authHeader !== `Bearer ${mcpAuthToken}`) {
         return res.status(401).json({ error: 'Unauthorized: Invalid or missing Bearer token' });
@@ -440,9 +440,135 @@ app.post('/message', async (req, res) => {
   }
 });
 
-// Basic REST endpoints for ChatGPT
+// Basic REST endpoints for ChatGPT Custom Actions
 app.post('/api/tools/:toolName', express.json(), async (req, res) => {
-  res.json({ error: "Use MCP SSE transport. OpenAPI proxy required." });
+  const { toolName } = req.params;
+  const mcp = createServer();
+  const tools = (mcp as any)._registeredTools;
+  const tool = tools && tools[toolName];
+  
+  if (!tool) {
+    return res.status(404).json({ error: `Tool ${toolName} not found` });
+  }
+
+  try {
+    const result = await tool.handler(req.body, {});
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/openapi.json', (req, res) => {
+  const schema = {
+    openapi: "3.1.0",
+    info: { title: "CallRail API", version: "1.1.0" },
+    servers: [{ url: `https://${req.get('host')}` }],
+    components: {
+      securitySchemes: {
+        ApiKeyAuth: { type: "http", scheme: "bearer" }
+      }
+    },
+    security: [{ ApiKeyAuth: [] }],
+    paths: {
+      "/api/tools/get_client_metrics": {
+        post: {
+          summary: "Get client metrics",
+          operationId: "get_client_metrics",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", properties: { account_id: { type: "string" }, company_id: { type: "string" }, date_range: { type: "string" } } } } }
+          },
+          responses: { "200": { description: "Success" } }
+        }
+      },
+      "/api/tools/list_companies": {
+        post: {
+          summary: "List companies",
+          operationId: "list_companies",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", properties: { account_id: { type: "string" } } } } }
+          },
+          responses: { "200": { description: "Success" } }
+        }
+      },
+      "/api/tools/list_accounts": {
+        post: {
+          summary: "List accounts",
+          operationId: "list_accounts",
+          responses: { "200": { description: "Success" } }
+        }
+      },
+      "/api/tools/list_all_calls": {
+        post: {
+          summary: "List all calls",
+          operationId: "list_all_calls",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", properties: { account_id: { type: "string" }, company_id: { type: "string" }, date_range: { type: "string" }, per_page: { type: "number" } } } } }
+          },
+          responses: { "200": { description: "Success" } }
+        }
+      },
+      "/api/tools/list_form_submissions": {
+        post: {
+          summary: "List form submissions",
+          operationId: "list_form_submissions",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", properties: { account_id: { type: "string" }, company_id: { type: "string" }, date_range: { type: "string" } } } } }
+          },
+          responses: { "200": { description: "Success" } }
+        }
+      },
+      "/api/tools/get_marketing_data": {
+        post: {
+          summary: "Get marketing data",
+          operationId: "get_marketing_data",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", properties: { account_id: { type: "string" }, date_range: { type: "string" } } } } }
+          },
+          responses: { "200": { description: "Success" } }
+        }
+      },
+      "/api/tools/get_call_details": {
+        post: {
+          summary: "Get call details",
+          operationId: "get_call_details",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", properties: { account_id: { type: "string" }, call_id: { type: "string" } } } } }
+          },
+          responses: { "200": { description: "Success" } }
+        }
+      },
+      "/api/tools/update_call": {
+        post: {
+          summary: "Update call",
+          operationId: "update_call",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", properties: { account_id: { type: "string" }, call_id: { type: "string" }, note: { type: "string" }, tags: { type: "array", items: { type: "string" } }, customer_name: { type: "string" }, lead_status: { type: "string" }, value: { type: "string" } } } } }
+          },
+          responses: { "200": { description: "Success" } }
+        }
+      },
+      "/api/tools/send_text_message": {
+        post: {
+          summary: "Send text message",
+          operationId: "send_text_message",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", properties: { account_id: { type: "string" }, company_id: { type: "string" }, customer_phone_number: { type: "string" }, tracking_number: { type: "string" }, content: { type: "string" } } } } }
+          },
+          responses: { "200": { description: "Success" } }
+        }
+      }
+    }
+  };
+  res.json(schema);
 });
 
 const transportType = process.env.TRANSPORT || 'stdio';
