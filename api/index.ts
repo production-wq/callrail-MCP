@@ -6,7 +6,8 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import { z } from "zod";
-
+import jwt from "jsonwebtoken";
+import crypto from "crypto";
 
 // Helper to get CallRail API key
 const getApiKey = (args: any) => args.api_key || process.env.CALLRAIL_API_KEY;
@@ -374,29 +375,189 @@ function createServer() {
 
 const app = express();
 
-// Basic configurations for Web clients
-app.use(cors());
+// =============================================================================
+// OAuth 2.0 Authorization Server
+// =============================================================================
+const OAUTH_CLIENT_ID     = process.env.OAUTH_CLIENT_ID     || 'callrail-mcp-client';
+const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || 'callrail-mcp-secret-change-me';
+const OAUTH_USERNAME      = process.env.OAUTH_USERNAME      || 'admin';
+const OAUTH_PASSWORD      = process.env.OAUTH_PASSWORD      || 'CallRail2024!';
+const JWT_SECRET          = process.env.JWT_SECRET          || crypto.randomBytes(32).toString('hex');
+const mcpAuthToken        = process.env.MCP_API_KEY;
 
-// Optional: Global MCP Server Authentication
-const mcpAuthToken = process.env.MCP_API_KEY;
-if (mcpAuthToken) {
-  app.use((req, res, next) => {
-    // Browsers don't send auth headers on OPTIONS preflight
-    if (req.method === 'OPTIONS') {
-      return next();
-    }
-    // Only protect /sse, /message, /mcp, and /api/tools paths
-    if (req.path === '/sse' || req.path === '/message' || req.path === '/mcp' || req.path.startsWith('/api/tools')) {
-      const authHeader = req.headers.authorization;
-      if (!authHeader || authHeader !== `Bearer ${mcpAuthToken}`) {
-        return res.status(401).json({ error: 'Unauthorized: Invalid or missing Bearer token' });
-      }
-    }
-    next();
-  });
+// In-memory auth code store  { code -> { clientId, redirectUri, expiresAt } }
+const authCodes = new Map<string, { clientId: string; redirectUri: string; expiresAt: number }>();
+// In-memory refresh token store  { refreshToken -> { clientId } }
+const refreshTokens = new Map<string, { clientId: string }>();
+
+// Clean up stale auth codes every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, data] of authCodes) {
+    if (data.expiresAt < now) authCodes.delete(code);
+  }
+}, 5 * 60 * 1000);
+
+function generateAccessToken(clientId: string) {
+  return jwt.sign({ clientId, type: 'access' }, JWT_SECRET, { expiresIn: '1h' });
 }
 
+function verifyAccessToken(token: string): boolean {
+  try { const p = jwt.verify(token, JWT_SECRET) as any; return p.type === 'access'; }
+  catch { return false; }
+}
+
+// ── Auth Middleware ──────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') return next();
+
+  const isProtected =
+    req.path === '/sse' || req.path === '/message' || req.path === '/mcp' ||
+    req.path.startsWith('/api/tools');
+  if (!isProtected) return next();
+
+  const authHeader  = req.headers.authorization || '';
+  const queryToken  = (req.query.token as string) || '';
+
+  // 1. Legacy bearer API key (still works for Claude / Perplexity)
+  if (mcpAuthToken && (authHeader === `Bearer ${mcpAuthToken}` || queryToken === mcpAuthToken)) {
+    return next();
+  }
+
+  // 2. OAuth JWT access token
+  const bearerMatch = authHeader.match(/^Bearer (.+)$/);
+  if (bearerMatch && verifyAccessToken(bearerMatch[1])) return next();
+  if (queryToken && verifyAccessToken(queryToken)) return next();
+
+  return res.status(401).json({ error: 'Unauthorized' });
+});
+
+// ── GET /oauth/authorize  (ChatGPT redirects user here) ─────────────────────
+app.get('/oauth/authorize', (req, res) => {
+  const { client_id, redirect_uri, state, response_type } = req.query as Record<string, string>;
+  if (response_type !== 'code') {
+    return res.status(400).send('Only response_type=code is supported');
+  }
+
+  // Show a simple, styled login page
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CallRail MCP — Sign In</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #0f172a; display: flex; align-items: center;
+           justify-content: center; min-height: 100vh; }
+    .card { background: #1e293b; border-radius: 16px; padding: 40px 36px;
+            width: 100%; max-width: 400px; box-shadow: 0 25px 50px rgba(0,0,0,.5); }
+    .logo { font-size: 28px; font-weight: 700; color: #38bdf8; text-align: center; margin-bottom: 8px; }
+    .subtitle { color: #94a3b8; font-size: 14px; text-align: center; margin-bottom: 32px; }
+    label { display: block; color: #cbd5e1; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+    input { width: 100%; padding: 12px 14px; border-radius: 8px; border: 1px solid #334155;
+            background: #0f172a; color: #f1f5f9; font-size: 15px; outline: none;
+            transition: border-color .2s; margin-bottom: 18px; }
+    input:focus { border-color: #38bdf8; }
+    button { width: 100%; padding: 13px; border-radius: 8px; border: none;
+             background: #38bdf8; color: #0f172a; font-size: 16px; font-weight: 700;
+             cursor: pointer; transition: background .2s; }
+    button:hover { background: #7dd3fc; }
+    .error { color: #f87171; font-size: 13px; margin-bottom: 16px; text-align: center; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">📞 CallRail MCP</div>
+  <div class="subtitle">Sign in to connect your CallRail data</div>
+  ${req.query.error ? '<div class="error">Invalid username or password. Please try again.</div>' : ''}
+  <form method="POST" action="/oauth/authorize">
+    <input type="hidden" name="client_id"     value="${client_id || ''}">
+    <input type="hidden" name="redirect_uri"  value="${redirect_uri || ''}">
+    <input type="hidden" name="state"         value="${state || ''}">
+    <input type="hidden" name="response_type" value="${response_type || 'code'}">
+    <label for="username">Username</label>
+    <input type="text"     id="username" name="username" placeholder="admin" required autofocus>
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" placeholder="••••••••••" required>
+    <button type="submit">Sign In →</button>
+  </form>
+</div>
+</body>
+</html>`);
+});
+
+// ── POST /oauth/authorize  (form submission) ──────────────────────────────────
+app.post('/oauth/authorize', express.urlencoded({ extended: false }), (req, res) => {
+  const { client_id, redirect_uri, state, response_type, username, password } = req.body;
+
+  // Validate credentials
+  if (username !== OAUTH_USERNAME || password !== OAUTH_PASSWORD) {
+    const params = new URLSearchParams({ client_id, redirect_uri: redirect_uri || '', state: state || '', response_type: response_type || 'code', error: '1' });
+    return res.redirect(`/oauth/authorize?${params}`);
+  }
+
+  // Generate a one-time auth code (expires in 5 min)
+  const code = crypto.randomBytes(24).toString('hex');
+  authCodes.set(code, { clientId: client_id, redirectUri: redirect_uri, expiresAt: Date.now() + 5 * 60 * 1000 });
+
+  const callbackParams = new URLSearchParams({ code, state: state || '' });
+  res.redirect(`${redirect_uri}?${callbackParams}`);
+});
+
+// ── POST /oauth/token  (ChatGPT exchanges code → access token) ───────────────
+app.post('/oauth/token', express.urlencoded({ extended: false }), express.json(), (req, res) => {
+  const { grant_type, code, client_id, client_secret, redirect_uri, refresh_token } = req.body;
+
+  // Validate client credentials
+  if (client_id !== OAUTH_CLIENT_ID || client_secret !== OAUTH_CLIENT_SECRET) {
+    return res.status(401).json({ error: 'invalid_client' });
+  }
+
+  if (grant_type === 'authorization_code') {
+    const stored = authCodes.get(code);
+    if (!stored || stored.clientId !== client_id || stored.expiresAt < Date.now()) {
+      return res.status(400).json({ error: 'invalid_grant' });
+    }
+    authCodes.delete(code);
+
+    const accessToken  = generateAccessToken(client_id);
+    const newRefresh   = crypto.randomBytes(32).toString('hex');
+    refreshTokens.set(newRefresh, { clientId: client_id });
+
+    return res.json({ access_token: accessToken, token_type: 'bearer', expires_in: 3600, refresh_token: newRefresh });
+  }
+
+  if (grant_type === 'refresh_token') {
+    const stored = refreshTokens.get(refresh_token);
+    if (!stored || stored.clientId !== client_id) {
+      return res.status(400).json({ error: 'invalid_grant' });
+    }
+    const accessToken = generateAccessToken(client_id);
+    return res.json({ access_token: accessToken, token_type: 'bearer', expires_in: 3600, refresh_token });
+  }
+
+  return res.status(400).json({ error: 'unsupported_grant_type' });
+});
+
+// ── GET /.well-known/oauth-authorization-server  (auto-discovery) ────────────
+app.get('/.well-known/oauth-authorization-server', (req, res) => {
+  const base = `https://${req.get('host')}`;
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/oauth/authorize`,
+    token_endpoint: `${base}/oauth/token`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    token_endpoint_auth_methods_supported: ['client_secret_post'],
+    scopes_supported: ['read', 'write']
+  });
+});
+
 const transports = new Map<string, SSEServerTransport>();
+
 
 // Streamable HTTP (stateless): a fresh server per request, so it works behind
 // Render/Vercel restarts and multiple instances.
