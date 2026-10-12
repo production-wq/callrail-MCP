@@ -374,40 +374,107 @@ function createServer() {
 }
 
 const app = express();
+app.set('trust proxy', true);
 
 // =============================================================================
-// OAuth 2.0 Authorization Server
+// OAuth 2.1 Authorization Server (for ChatGPT / any MCP client that needs OAuth)
+//
+// Fully STATELESS: authorization codes, refresh tokens and dynamically
+// registered clients are all signed JWTs. Nothing is kept in memory, so this
+// works on Vercel where /authorize and /token can hit different instances.
 // =============================================================================
-const OAUTH_CLIENT_ID     = process.env.OAUTH_CLIENT_ID     || 'callrail-mcp-client';
-const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || 'callrail-mcp-secret-change-me';
-const OAUTH_USERNAME      = process.env.OAUTH_USERNAME      || 'admin';
-const OAUTH_PASSWORD      = process.env.OAUTH_PASSWORD      || 'CallRail2024!';
-const JWT_SECRET          = process.env.JWT_SECRET          || crypto.randomBytes(32).toString('hex');
+const OAUTH_CLIENT_ID     = process.env.OAUTH_CLIENT_ID     || '';
+const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || '';
+const OAUTH_USERNAME      = process.env.OAUTH_USERNAME      || '';
+const OAUTH_PASSWORD      = process.env.OAUTH_PASSWORD      || '';
+const JWT_SECRET          = process.env.JWT_SECRET          || '';
 const mcpAuthToken        = process.env.MCP_API_KEY;
 
-// In-memory auth code store  { code -> { clientId, redirectUri, expiresAt } }
-const authCodes = new Map<string, { clientId: string; redirectUri: string; expiresAt: number }>();
-// In-memory refresh token store  { refreshToken -> { clientId } }
-const refreshTokens = new Map<string, { clientId: string }>();
+const OAUTH_ENABLED = Boolean(JWT_SECRET && OAUTH_USERNAME && OAUTH_PASSWORD);
+if (!OAUTH_ENABLED) {
+  console.error('[oauth] OAuth disabled: set JWT_SECRET, OAUTH_USERNAME and OAUTH_PASSWORD to enable it.');
+}
 
-// Clean up stale auth codes every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [code, data] of authCodes) {
-    if (data.expiresAt < now) authCodes.delete(code);
+const SCOPES      = ['read', 'write'];
+const ACCESS_TTL  = 60 * 60;            // 1 hour
+const REFRESH_TTL = 30 * 24 * 60 * 60;  // 30 days
+const CODE_TTL    = 120;                // 2 minutes
+
+// Redirect URIs OAuth clients may use. Extra exact URIs: OAUTH_ALLOWED_REDIRECT_URIS (comma separated).
+const REDIRECT_ALLOWLIST: RegExp[] = [
+  /^https:\/\/chatgpt\.com\/(connector_platform_oauth_redirect|connector\/oauth\/[^/?#]+|aip\/[^/?#]+\/oauth\/callback)$/,
+  /^https:\/\/chat\.openai\.com\/(connector_platform_oauth_redirect|connector\/oauth\/[^/?#]+|aip\/[^/?#]+\/oauth\/callback)$/,
+  /^https:\/\/platform\.openai\.com\/apps-manage\/oauth$/,
+  /^https:\/\/claude\.(ai|com)\/api\/mcp\/auth_callback$/,
+  /^https:\/\/([a-z0-9-]+\.)?perplexity\.ai\/.*$/,
+  /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/.*$/
+];
+const EXTRA_REDIRECTS = (process.env.OAUTH_ALLOWED_REDIRECT_URIS || '').split(',').map(s => s.trim()).filter(Boolean);
+const isAllowlistedRedirect = (uri: string) => EXTRA_REDIRECTS.includes(uri) || REDIRECT_ALLOWLIST.some(r => r.test(uri));
+
+const esc = (s: unknown) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c]);
+const s256 = (verifier: string) => crypto.createHash('sha256').update(verifier).digest('base64url');
+
+// Constant-time string compare (hashes first so lengths never leak).
+function safeEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a).digest();
+  const hb = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function baseUrl(req: express.Request): string {
+  const configured = process.env.PUBLIC_BASE_URL;
+  if (configured) return configured.replace(/\/+$/, '');
+  const host = req.get('host') || 'localhost';
+  const local = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(host);
+  return `${local ? req.protocol : 'https'}://${host}`;
+}
+
+// ── Clients ──────────────────────────────────────────────────────────────────
+type OAuthClient = { id: string; name: string; redirectUris: string[] | null; secret?: string };
+
+const derivedClientSecret = (clientId: string) =>
+  crypto.createHmac('sha256', JWT_SECRET).update(`client-secret:${clientId}`).digest('hex');
+
+function resolveClient(clientId: string | undefined): OAuthClient | null {
+  if (!clientId || !JWT_SECRET) return null;
+  // 1. The pre-configured client (OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET)
+  if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && safeEqual(clientId, OAUTH_CLIENT_ID)) {
+    return { id: OAUTH_CLIENT_ID, name: 'CallRail MCP client', redirectUris: null, secret: OAUTH_CLIENT_SECRET };
   }
-}, 5 * 60 * 1000);
+  // 2. A client created through Dynamic Client Registration (client_id is a signed JWT)
+  try {
+    const p = jwt.verify(clientId, JWT_SECRET, { algorithms: ['HS256'] }) as any;
+    if (p.type === 'client') {
+      return { id: clientId, name: p.name || 'MCP client', redirectUris: p.ru || [], secret: p.conf ? derivedClientSecret(clientId) : undefined };
+    }
+  } catch { /* not a registered client */ }
+  return null;
+}
 
-function generateAccessToken(clientId: string) {
-  return jwt.sign({ clientId, type: 'access' }, JWT_SECRET, { expiresIn: '1h' });
+const redirectAllowed = (client: OAuthClient, uri: string) =>
+  client.redirectUris ? client.redirectUris.includes(uri) : isAllowlistedRedirect(uri);
+
+// ── Tokens ───────────────────────────────────────────────────────────────────
+function issueTokens(clientId: string, scope: string, aud: string) {
+  const access_token  = jwt.sign({ type: 'access',  cid: clientId, scope, aud }, JWT_SECRET, { algorithm: 'HS256', expiresIn: ACCESS_TTL });
+  const refresh_token = jwt.sign({ type: 'refresh', cid: clientId, scope, aud }, JWT_SECRET, { algorithm: 'HS256', expiresIn: REFRESH_TTL });
+  return { access_token, token_type: 'Bearer', expires_in: ACCESS_TTL, refresh_token, scope };
 }
 
 function verifyAccessToken(token: string): boolean {
-  try { const p = jwt.verify(token, JWT_SECRET) as any; return p.type === 'access'; }
+  if (!JWT_SECRET) return false;
+  try { return (jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as any).type === 'access'; }
   catch { return false; }
 }
 
-// ── Auth Middleware ──────────────────────────────────────────────────────────
+// Best-effort single-use enforcement for auth codes (per instance; PKCE + 2 min expiry cover the rest).
+const usedCodes = new Set<string>();
+
+// ── CORS (browser based MCP clients, e.g. MCP Inspector) ──────────────────────
+app.use(cors({ exposedHeaders: ['WWW-Authenticate', 'Mcp-Session-Id'] }));
+
+// ── Auth middleware for the MCP / tool endpoints ─────────────────────────────
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return next();
 
@@ -416,32 +483,100 @@ app.use((req, res, next) => {
     req.path.startsWith('/api/tools');
   if (!isProtected) return next();
 
-  const authHeader  = req.headers.authorization || '';
-  const queryToken  = (req.query.token as string) || '';
+  const authHeader = req.headers.authorization || '';
+  const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
+  const bearer     = (authHeader.match(/^Bearer (.+)$/i) || [])[1] || '';
+  const presented  = bearer || queryToken;
 
-  // 1. Legacy bearer API key (still works for Claude / Perplexity)
-  if (mcpAuthToken && (authHeader === `Bearer ${mcpAuthToken}` || queryToken === mcpAuthToken)) {
-    return next();
-  }
+  // 1. Static API key (Claude / Perplexity)
+  if (mcpAuthToken && presented && safeEqual(presented, mcpAuthToken)) return next();
+  // 2. OAuth access token (ChatGPT)
+  if (presented && verifyAccessToken(presented)) return next();
 
-  // 2. OAuth JWT access token
-  const bearerMatch = authHeader.match(/^Bearer (.+)$/);
-  if (bearerMatch && verifyAccessToken(bearerMatch[1])) return next();
-  if (queryToken && verifyAccessToken(queryToken)) return next();
-
-  return res.status(401).json({ error: 'Unauthorized' });
+  // Tell the client where to authenticate (RFC 9728 / MCP authorization spec).
+  const suffix = req.path === '/mcp' || req.path === '/sse' ? req.path : '';
+  const challenge = [`Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource${suffix}"`, `scope="${SCOPES.join(' ')}"`];
+  if (presented) challenge.push('error="invalid_token"');
+  res.set('WWW-Authenticate', challenge.join(', '));
+  return res.status(401).json({ error: 'unauthorized', error_description: 'A valid access token is required.' });
 });
 
-// ── GET /oauth/authorize  (ChatGPT redirects user here) ─────────────────────
-app.get('/oauth/authorize', (req, res) => {
-  const { client_id, redirect_uri, state, response_type } = req.query as Record<string, string>;
-  if (response_type !== 'code') {
-    return res.status(400).send('Only response_type=code is supported');
-  }
+// ── Discovery ────────────────────────────────────────────────────────────────
+// RFC 9728: where to find the authorization server for this MCP server.
+app.get(['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/*path'], (req, res) => {
+  const base = baseUrl(req);
+  const p = (req.params as any).path;
+  const resourcePath = p ? '/' + (Array.isArray(p) ? p.join('/') : p) : '/mcp';
+  res.json({
+    resource: `${base}${resourcePath}`,
+    authorization_servers: [base],
+    scopes_supported: SCOPES,
+    bearer_methods_supported: ['header'],
+    resource_name: 'CallRail MCP'
+  });
+});
 
-  // Show a simple, styled login page
-  res.setHeader('Content-Type', 'text/html');
-  res.send(`<!DOCTYPE html>
+// RFC 8414 (also served as openid-configuration for clients that only look there).
+const authServerMetadata = (req: express.Request, res: express.Response) => {
+  const base = baseUrl(req);
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/oauth/authorize`,
+    token_endpoint: `${base}/oauth/token`,
+    registration_endpoint: `${base}/oauth/register`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+    scopes_supported: SCOPES,
+    authorization_response_iss_parameter_supported: true
+  });
+};
+app.get(['/.well-known/oauth-authorization-server', '/.well-known/oauth-authorization-server/*path'], authServerMetadata);
+app.get(['/.well-known/openid-configuration', '/.well-known/openid-configuration/*path'], authServerMetadata);
+
+// ── Dynamic Client Registration (RFC 7591) ───────────────────────────────────
+app.post('/oauth/register', express.json(), (req, res) => {
+  res.set({ 'Cache-Control': 'no-store', Pragma: 'no-cache' });
+  if (!OAUTH_ENABLED) return res.status(503).json({ error: 'temporarily_unavailable', error_description: 'OAuth is not configured on this server.' });
+
+  const m = req.body || {};
+  const uris: string[] = Array.isArray(m.redirect_uris) ? m.redirect_uris.filter((u: unknown) => typeof u === 'string') : [];
+  if (!uris.length || !uris.every(isAllowlistedRedirect)) {
+    return res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris missing or not on the allowlist.' });
+  }
+  const method: string = m.token_endpoint_auth_method || 'client_secret_basic';
+  if (!['none', 'client_secret_post', 'client_secret_basic'].includes(method)) {
+    return res.status(400).json({ error: 'invalid_client_metadata', error_description: 'Unsupported token_endpoint_auth_method.' });
+  }
+  const name = String(m.client_name || 'MCP client').slice(0, 80);
+  const confidential = method !== 'none';
+  const clientId = jwt.sign({ type: 'client', name, ru: uris, conf: confidential }, JWT_SECRET, { algorithm: 'HS256' });
+
+  console.log(`[oauth] registered client "${name}" method=${method}`);
+  return res.status(201).json({
+    client_id: clientId,
+    ...(confidential ? { client_secret: derivedClientSecret(clientId), client_secret_expires_at: 0 } : {}),
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    client_name: name,
+    redirect_uris: uris,
+    grant_types: ['authorization_code', 'refresh_token'],
+    response_types: ['code'],
+    token_endpoint_auth_method: method,
+    scope: SCOPES.join(' ')
+  });
+});
+
+// ── Authorization endpoint ───────────────────────────────────────────────────
+function errorPage(res: express.Response, message: string) {
+  res.status(400).type('html').send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Authorization error</title></head>
+<body style="font-family:sans-serif;max-width:480px;margin:80px auto;color:#0f172a"><h2>Authorization error</h2><p>${esc(message)}</p></body></html>`);
+}
+
+function loginPage(res: express.Response, f: Record<string, string>, client: OAuthClient, failed: boolean) {
+  const hidden = ['client_id', 'redirect_uri', 'state', 'response_type', 'code_challenge', 'code_challenge_method', 'scope', 'resource']
+    .map(k => `<input type="hidden" name="${k}" value="${esc(f[k])}">`).join('\n    ');
+  res.status(failed ? 401 : 200).type('html').send(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -455,9 +590,9 @@ app.get('/oauth/authorize', (req, res) => {
     .card { background: #1e293b; border-radius: 16px; padding: 40px 36px;
             width: 100%; max-width: 400px; box-shadow: 0 25px 50px rgba(0,0,0,.5); }
     .logo { font-size: 28px; font-weight: 700; color: #38bdf8; text-align: center; margin-bottom: 8px; }
-    .subtitle { color: #94a3b8; font-size: 14px; text-align: center; margin-bottom: 32px; }
+    .subtitle { color: #94a3b8; font-size: 14px; text-align: center; margin-bottom: 32px; line-height: 1.5; }
     label { display: block; color: #cbd5e1; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
-    input { width: 100%; padding: 12px 14px; border-radius: 8px; border: 1px solid #334155;
+    input[type=text], input[type=password] { width: 100%; padding: 12px 14px; border-radius: 8px; border: 1px solid #334155;
             background: #0f172a; color: #f1f5f9; font-size: 15px; outline: none;
             transition: border-color .2s; margin-bottom: 18px; }
     input:focus { border-color: #38bdf8; }
@@ -471,89 +606,151 @@ app.get('/oauth/authorize', (req, res) => {
 <body>
 <div class="card">
   <div class="logo">📞 CallRail MCP</div>
-  <div class="subtitle">Sign in to connect your CallRail data</div>
-  ${req.query.error ? '<div class="error">Invalid username or password. Please try again.</div>' : ''}
+  <div class="subtitle"><strong>${esc(client.name)}</strong> wants read &amp; write access to your CallRail data.</div>
+  ${failed ? '<div class="error">Invalid username or password. Please try again.</div>' : ''}
   <form method="POST" action="/oauth/authorize">
-    <input type="hidden" name="client_id"     value="${client_id || ''}">
-    <input type="hidden" name="redirect_uri"  value="${redirect_uri || ''}">
-    <input type="hidden" name="state"         value="${state || ''}">
-    <input type="hidden" name="response_type" value="${response_type || 'code'}">
+    ${hidden}
     <label for="username">Username</label>
-    <input type="text"     id="username" name="username" placeholder="admin" required autofocus>
+    <input type="text" id="username" name="username" autocomplete="username" required autofocus>
     <label for="password">Password</label>
-    <input type="password" id="password" name="password" placeholder="••••••••••" required>
-    <button type="submit">Sign In →</button>
+    <input type="password" id="password" name="password" autocomplete="current-password" required>
+    <button type="submit">Authorize →</button>
   </form>
 </div>
 </body>
 </html>`);
+}
+
+// Shared by GET and POST. Returns the client, or sends an error page and returns null.
+// Problems with client_id / redirect_uri are NEVER redirected (RFC 6749 §4.1.2.1).
+function checkAuthRequest(f: Record<string, string>, res: express.Response): OAuthClient | null {
+  if (!OAUTH_ENABLED) { errorPage(res, 'OAuth is not configured on this server.'); return null; }
+  const client = resolveClient(f.client_id);
+  if (!client) { errorPage(res, 'Unknown client_id.'); return null; }
+  if (!f.redirect_uri || !redirectAllowed(client, f.redirect_uri)) { errorPage(res, 'This redirect_uri is not allowed for this client.'); return null; }
+  return client;
+}
+
+function redirectWithError(res: express.Response, base: string, f: Record<string, string>, error: string, description: string) {
+  const target = new URL(f.redirect_uri);
+  target.searchParams.set('error', error);
+  target.searchParams.set('error_description', description);
+  if (f.state) target.searchParams.set('state', f.state);
+  target.searchParams.set('iss', base);
+  return res.redirect(303, target.toString());
+}
+
+// Protocol-level validation (after client + redirect are known good). Returns an error code/description or null.
+function authRequestProblem(f: Record<string, string>, client: OAuthClient): [string, string] | null {
+  if (f.response_type !== 'code') return ['unsupported_response_type', 'Only response_type=code is supported.'];
+  if (f.code_challenge) {
+    if (f.code_challenge_method !== 'S256') return ['invalid_request', 'code_challenge_method must be S256.'];
+  } else if (!client.secret) {
+    return ['invalid_request', 'PKCE (code_challenge with S256) is required for public clients.'];
+  }
+  return null;
+}
+
+const AUTH_FIELDS = ['client_id', 'redirect_uri', 'state', 'response_type', 'code_challenge', 'code_challenge_method', 'scope', 'resource'];
+const pickFields = (src: any) => Object.fromEntries(AUTH_FIELDS.map(k => [k, typeof src?.[k] === 'string' ? src[k] : ''])) as Record<string, string>;
+
+app.get('/oauth/authorize', (req, res) => {
+  const f = pickFields(req.query);
+  const client = checkAuthRequest(f, res);
+  if (!client) return;
+  const problem = authRequestProblem(f, client);
+  if (problem) return redirectWithError(res, baseUrl(req), f, problem[0], problem[1]);
+  loginPage(res, f, client, false);
 });
 
-// ── POST /oauth/authorize  (form submission) ──────────────────────────────────
-app.post('/oauth/authorize', express.urlencoded({ extended: false }), (req, res) => {
-  const { client_id, redirect_uri, state, response_type, username, password } = req.body;
+app.post('/oauth/authorize', express.urlencoded({ extended: false }), async (req, res) => {
+  const f = pickFields(req.body);
+  const client = checkAuthRequest(f, res);
+  if (!client) return;
+  const problem = authRequestProblem(f, client);
+  if (problem) return redirectWithError(res, baseUrl(req), f, problem[0], problem[1]);
 
-  // Validate credentials
-  if (username !== OAUTH_USERNAME || password !== OAUTH_PASSWORD) {
-    const params = new URLSearchParams({ client_id, redirect_uri: redirect_uri || '', state: state || '', response_type: response_type || 'code', error: '1' });
-    return res.redirect(`/oauth/authorize?${params}`);
+  const username = typeof req.body?.username === 'string' ? req.body.username : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const userOk = safeEqual(username, OAUTH_USERNAME);
+  const passOk = safeEqual(password, OAUTH_PASSWORD);
+  if (!(userOk && passOk)) {
+    await new Promise(r => setTimeout(r, 500)); // slow down guessing
+    console.warn('[oauth] failed sign-in attempt');
+    return loginPage(res, f, client, true);
   }
 
-  // Generate a one-time auth code (expires in 5 min)
-  const code = crypto.randomBytes(24).toString('hex');
-  authCodes.set(code, { clientId: client_id, redirectUri: redirect_uri, expiresAt: Date.now() + 5 * 60 * 1000 });
-
-  const callbackParams = new URLSearchParams({ code, state: state || '' });
-  res.redirect(`${redirect_uri}?${callbackParams}`);
+  const base = baseUrl(req);
+  const scope = f.scope || SCOPES.join(' ');
+  const code = jwt.sign(
+    { type: 'code', cid: client.id, ru: f.redirect_uri, cc: f.code_challenge || null, scope, res: f.resource || `${base}/mcp`, jti: crypto.randomUUID() },
+    JWT_SECRET, { algorithm: 'HS256', expiresIn: CODE_TTL }
+  );
+  const target = new URL(f.redirect_uri);
+  target.searchParams.set('code', code);
+  if (f.state) target.searchParams.set('state', f.state);
+  target.searchParams.set('iss', base);
+  console.log(`[oauth] authorized client "${client.name}"`);
+  return res.redirect(303, target.toString());
 });
 
-// ── POST /oauth/token  (ChatGPT exchanges code → access token) ───────────────
+// ── Token endpoint ───────────────────────────────────────────────────────────
 app.post('/oauth/token', express.urlencoded({ extended: false }), express.json(), (req, res) => {
-  const { grant_type, code, client_id, client_secret, redirect_uri, refresh_token } = req.body;
+  res.set({ 'Cache-Control': 'no-store', Pragma: 'no-cache' });
+  const oauthError = (status: number, error: string, description?: string) =>
+    res.status(status).json({ error, ...(description ? { error_description: description } : {}) });
+  if (!OAUTH_ENABLED) return oauthError(503, 'temporarily_unavailable', 'OAuth is not configured on this server.');
 
-  // Validate client credentials
-  if (client_id !== OAUTH_CLIENT_ID || client_secret !== OAUTH_CLIENT_SECRET) {
-    return res.status(401).json({ error: 'invalid_client' });
+  const b = req.body || {};
+  let clientId: string | undefined = b.client_id;
+  let clientSecret: string | undefined = b.client_secret;
+  const basic = (req.headers.authorization || '').match(/^Basic (.+)$/i);
+  if (basic) {
+    try {
+      const decoded = Buffer.from(basic[1], 'base64').toString('utf8');
+      const i = decoded.indexOf(':');
+      clientId = decodeURIComponent(decoded.slice(0, i));
+      clientSecret = decodeURIComponent(decoded.slice(i + 1));
+    } catch { return oauthError(401, 'invalid_client', 'Malformed Basic credentials.'); }
   }
 
-  if (grant_type === 'authorization_code') {
-    const stored = authCodes.get(code);
-    if (!stored || stored.clientId !== client_id || stored.expiresAt < Date.now()) {
-      return res.status(400).json({ error: 'invalid_grant' });
+  const client = resolveClient(clientId);
+  if (!client) return oauthError(401, 'invalid_client', 'Unknown client.');
+  if (client.secret && !(typeof clientSecret === 'string' && safeEqual(clientSecret, client.secret))) {
+    return oauthError(401, 'invalid_client', 'Bad client credentials.');
+  }
+
+  if (b.grant_type === 'authorization_code') {
+    let p: any;
+    try { p = jwt.verify(String(b.code || ''), JWT_SECRET, { algorithms: ['HS256'] }); }
+    catch { return oauthError(400, 'invalid_grant', 'Invalid or expired authorization code.'); }
+    if (p.type !== 'code' || p.cid !== client.id) return oauthError(400, 'invalid_grant', 'Code was not issued to this client.');
+    if (b.redirect_uri !== undefined && b.redirect_uri !== p.ru) return oauthError(400, 'invalid_grant', 'redirect_uri mismatch.');
+    if (usedCodes.has(p.jti)) return oauthError(400, 'invalid_grant', 'Authorization code already used.');
+
+    if (p.cc) {
+      const v = typeof b.code_verifier === 'string' ? b.code_verifier : '';
+      if (!/^[A-Za-z0-9\-._~]{43,128}$/.test(v) || !safeEqual(s256(v), p.cc)) {
+        return oauthError(400, 'invalid_grant', 'PKCE verification failed.');
+      }
     }
-    authCodes.delete(code);
+    usedCodes.add(p.jti);
+    setTimeout(() => usedCodes.delete(p.jti), (CODE_TTL + 5) * 1000).unref?.();
 
-    const accessToken  = generateAccessToken(client_id);
-    const newRefresh   = crypto.randomBytes(32).toString('hex');
-    refreshTokens.set(newRefresh, { clientId: client_id });
-
-    return res.json({ access_token: accessToken, token_type: 'bearer', expires_in: 3600, refresh_token: newRefresh });
+    console.log(`[oauth] issued tokens to "${client.name}" (authorization_code)`);
+    return res.json(issueTokens(client.id, p.scope, p.res));
   }
 
-  if (grant_type === 'refresh_token') {
-    const stored = refreshTokens.get(refresh_token);
-    if (!stored || stored.clientId !== client_id) {
-      return res.status(400).json({ error: 'invalid_grant' });
-    }
-    const accessToken = generateAccessToken(client_id);
-    return res.json({ access_token: accessToken, token_type: 'bearer', expires_in: 3600, refresh_token });
+  if (b.grant_type === 'refresh_token') {
+    let p: any;
+    try { p = jwt.verify(String(b.refresh_token || ''), JWT_SECRET, { algorithms: ['HS256'] }); }
+    catch { return oauthError(400, 'invalid_grant', 'Invalid or expired refresh token.'); }
+    if (p.type !== 'refresh' || p.cid !== client.id) return oauthError(400, 'invalid_grant', 'Refresh token was not issued to this client.');
+    console.log(`[oauth] refreshed tokens for "${client.name}"`);
+    return res.json(issueTokens(client.id, p.scope, p.aud));
   }
 
-  return res.status(400).json({ error: 'unsupported_grant_type' });
-});
-
-// ── GET /.well-known/oauth-authorization-server  (auto-discovery) ────────────
-app.get('/.well-known/oauth-authorization-server', (req, res) => {
-  const base = `https://${req.get('host')}`;
-  res.json({
-    issuer: base,
-    authorization_endpoint: `${base}/oauth/authorize`,
-    token_endpoint: `${base}/oauth/token`,
-    response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code', 'refresh_token'],
-    token_endpoint_auth_methods_supported: ['client_secret_post'],
-    scopes_supported: ['read', 'write']
-  });
+  return oauthError(400, 'unsupported_grant_type');
 });
 
 const transports = new Map<string, SSEServerTransport>();

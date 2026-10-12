@@ -26,12 +26,28 @@ However, since you're deploying this on the web (Vercel) as an SSE endpoint, you
 
 *(If you don't set `MCP_API_KEY`, the endpoint remains public, meaning anyone with the URL can use it. It's highly recommended to set it).*
 
-## Using with ChatGPT
+## Using with ChatGPT (OAuth)
 
-ChatGPT Custom Actions (GPTs) do not support the MCP (SSE) protocol natively yet. They require a REST OpenAPI schema. 
-To use this with ChatGPT, you have two options:
-1. **Use an MCP Proxy**: Use a service like **LangSmith / LangChain** or **Glama**, which allows you to import an MCP server URL, and it automatically generates the OpenAPI schema and REST endpoints for you to paste into ChatGPT.
-2. **Direct Integration**: ChatGPT will need the `/api/tools/` endpoints mapped via an OpenAPI JSON. (Proxying via Smith is the most robust).
+The server is a standards-compliant OAuth 2.1 authorization server, so ChatGPT's MCP connector can connect directly.
+
+Required env vars: `JWT_SECRET`, `OAUTH_USERNAME`, `OAUTH_PASSWORD` (plus `CALLRAIL_API_KEY`). See `.env.example`.
+
+In ChatGPT (Settings → Apps/Connectors → Developer mode → Create):
+- **MCP server URL**: `https://<your-deployment>/mcp`
+- **Authentication**: OAuth, leave the client fields on automatic registration (Dynamic Client Registration).
+- ChatGPT opens the sign-in page; log in with `OAUTH_USERNAME` / `OAUTH_PASSWORD`.
+
+If you would rather paste a fixed client, set `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET` and enter the same values in ChatGPT.
+
+How it works:
+- Unauthenticated calls get `401` + `WWW-Authenticate: Bearer resource_metadata=...`
+- Discovery: `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`
+- Endpoints: `/oauth/register` (RFC 7591), `/oauth/authorize`, `/oauth/token`
+- PKCE `S256` is required; redirect URIs are restricted to ChatGPT / Claude / Perplexity / localhost (add more via `OAUTH_ALLOWED_REDIRECT_URIS`).
+- Fully stateless (signed JWTs), so it works on Vercel's serverless instances and survives restarts.
+- `MCP_API_KEY` bearer auth keeps working for Claude and Perplexity.
+
+The legacy REST endpoints (`/api/tools/*`, `/openapi.json`) still exist for Custom GPT Actions.
 
 ## Using with Claude & AntiGravity
 
